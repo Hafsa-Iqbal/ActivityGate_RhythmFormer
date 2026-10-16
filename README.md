@@ -8,6 +8,8 @@ pip install -r requirements.txt
 
 ## Usage
 
+See [RUNNING.md](RUNNING.md) for full step-by-step instructions (dataset preparation, reproducing the main results, and the ablation studies).
+
 Training and evaluation configs are under `configs/train_configs/`. For example, to train on the iBVP dataset with the proposed RGBT ActivityGate model use the follwoign:
 
 ```bash
