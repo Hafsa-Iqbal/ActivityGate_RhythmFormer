@@ -14,7 +14,7 @@ Training and evaluation configs are under `configs/train_configs/`. For example,
 python main.py --config_file configs/train_configs/intra/5IBVP_RGBT_ActivityGate.yaml
 ```
 
-Dataset paths in the config files are placeholders (`/path/to/workspace/...`), update `DATA_PATH` and `CACHED_PATH` in the relevant config to point to your local copy of the iBVP or SIM1 dataset before running.
+Dataset paths in the config files (`DATA_PATH`, `CACHED_PATH`) are set to the original development machine's local paths, update them in the relevant config to point to your own local copy of the iBVP or SIM1 dataset before running.
 
 Face detection defaults to Haar Cascade (`BACKEND: 'HC'`, bundled with OpenCV — no extra download needed), which is what all reported results use. An alternative YOLOv5Face backend (`BACKEND: 'Y5F'`) is also implemented but requires its own pretrained checkpoint, not included in this repository.
 
