@@ -1,5 +1,5 @@
-# Running the Code — Step-by-Step
-
+# Step-by-Step Guide
+ 
 This guide covers environment setup, dataset preparation, and reproducing the paper's main results (iBVP and SIM1, with and without ActivityGate) and key ablations.
 
 ## 1. Environment setup
@@ -14,9 +14,9 @@ Python 3.10 is recommended (matches the environment used for reported results).
 
 ## 2. Dataset preparation
 
-You need local copies of the **iBVP** and/or **SIM1** datasets. Neither is bundled with this repository.
+You need local copies of the **iBVP** and/or **SIM1** datasets.
 
-- **iBVP**: available from the dataset authors (Joshi & Cho, *Electronics*, 2024). Expected layout:
+- **iBVP**: Expected layout:
   ```
   <iBVP_root>/
     p02_a/
@@ -26,9 +26,9 @@ You need local copies of the **iBVP** and/or **SIM1** datasets. Neither is bundl
     p07_a/
       ...
   ```
-  All reported results use a single session per subject (the `_a` recordings).
+ 
 
-- **SIM1**: available from the dataset authors (Taamneh et al., *Scientific Data*, 2017). Expected layout:
+- **SIM1**: Expected layout:
   ```
   <SIM1_root>/
     Raw Thermal Data/T001/T001-RD.dat, T001-RD.inf, ...
@@ -41,12 +41,12 @@ You need local copies of the **iBVP** and/or **SIM1** datasets. Neither is bundl
 Every config under `configs/train_configs/intra/` has `DATA_PATH` and `CACHED_PATH` fields (under `TRAIN.DATA`, `VALID.DATA`, `TEST.DATA`) set to the paths used during development. Update these three occurrences in whichever config you run to point at your own `<iBVP_root>` / `<SIM1_root>`, and to a writable cache directory (preprocessed clips are written there on first run and reused afterward).
 
 `DO_PREPROCESS` controls whether raw data is re-chunked into clips on this run:
-- `True` — preprocess from raw data (required the first time, or after any preprocessing-affecting config change).
-- `False` — reuse an existing cache at `CACHED_PATH` (faster; use once the cache already exists).
+- `True`: preprocess from raw data (required the first time, or after any preprocessing-affecting config change).
+- `False`: reuse an existing cache at `CACHED_PATH` (faster; use once the cache already exists).
 
 ## 4. Reproduce the main results
 
-**iBVP, proposed model (RGBT + ActivityGate) — Table 1/3:**
+**iBVP, proposed model (RGBT with ActivityGate):**
 ```bash
 python main.py --config_file configs/train_configs/intra/5IBVP_RGBT_ActivityGate.yaml
 ```
@@ -56,7 +56,7 @@ python main.py --config_file configs/train_configs/intra/5IBVP_RGBT_ActivityGate
 python main.py --config_file configs/train_configs/intra/5IBVP_RGBT_NoGate.yaml
 ```
 
-**SIM1, proposed model (RGBT + ActivityGate, multi-task HR+BR) — Table 1/3:**
+**SIM1, proposed model (RGBT with ActivityGate, multi-task HR+BR):**
 ```bash
 python main.py --config_file configs/train_configs/intra/SIM1_RGBT_RD_ActivityGate.yaml
 ```
@@ -66,7 +66,7 @@ python main.py --config_file configs/train_configs/intra/SIM1_RGBT_RD_ActivityGa
 python main.py --config_file configs/train_configs/intra/SIM1_RGBT_RD_NoGate.yaml
 ```
 
-Each run trains for the number of epochs set in the config (50 by default), evaluates on the held-out test split at the end, and prints MAE/RMSE/MAPE/Pearson/SNR (iBVP) or per-task MAE/RMSE/MAPE/SNR (SIM1). Checkpoints are saved under `runs/exp/<run-name>/PreTrainedModels/`.
+Each run trains for the number of epochs set in the config, evaluates on the held-out test split at the end, and prints MAE/RMSE/MAPE/Pearson/SNR (iBVP) or per-task MAE/RMSE/MAPE/SNR (SIM1). Checkpoints are saved under `runs/exp/<run-name>/PreTrainedModels/`.
 
 ## 5. Reproduce the ablation studies
 
@@ -98,4 +98,4 @@ python main.py --config_file configs/train_configs/intra/SIM1_RGBT_RD_ActivityGa
 
 ## 7. Switching face-detection backend (optional)
 
-All reported results use Haar Cascade (`CROP_FACE.BACKEND: 'HC'`, bundled with OpenCV). To use the alternative YOLOv5Face backend instead, set `BACKEND: 'Y5F'` in the relevant config's `CROP_FACE` block — its pretrained checkpoint is included under `dataset/data_loader/face_detector/ckpts/` (GPL-3.0 licensed; see `dataset/data_loader/face_detector/LICENSE`).
+All files uses Haar Cascade (`CROP_FACE.BACKEND: 'HC'`, bundled with OpenCV) by default. To use the alternative YOLOv5Face backend instead, set `BACKEND: 'Y5F'` in the relevant config's `CROP_FACE` block, its pretrained checkpoint is included under `dataset/data_loader/face_detector/ckpts/` (see `dataset/data_loader/face_detector/LICENSE`).
