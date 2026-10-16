@@ -45,7 +45,7 @@ VALID:
     CACHED_PATH: "../dataset/iBVP/iBVP_Thermal_cache"
     EXP_DATA_NAME: "iBVP_RGBT_240_128x128"
     BEGIN: 0.7
-    END: 1.0
+    END: 0.86
     PREPROCESS:
       DATA_TYPE: [ 'Standardized' ]
       LABEL_TYPE: Standardized

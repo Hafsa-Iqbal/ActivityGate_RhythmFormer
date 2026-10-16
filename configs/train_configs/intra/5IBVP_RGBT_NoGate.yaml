@@ -45,7 +45,7 @@ VALID:
     CACHED_PATH: "../dataset/iBVP/iBVP_RGBT_cache_seqA"
     EXP_DATA_NAME: ""
     BEGIN: 0.72
-    END: 1.0
+    END: 0.86
     PREPROCESS:
       DATA_TYPE: [ 'Standardized' ]
       LABEL_TYPE: Standardized
@@ -76,7 +76,7 @@ TEST:
     DATA_PATH: "/mnt/nvme/hiqbal/dataset/iBVP/seqA/"
     CACHED_PATH: "../dataset/iBVP/iBVP_RGBT_cache_seqA"
     EXP_DATA_NAME: ""
-    BEGIN: 0.72
+    BEGIN: 0.86
     END: 1.0
     PREPROCESS:
       DATA_TYPE: [ 'Standardized' ]
