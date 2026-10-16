@@ -1,0 +1,792 @@
+"""The Base Class for data-loading.
+
+Provides a pytorch-style data-loader for end-to-end training pipelines.
+Extend the class to support specific datasets.
+Dataset already supported: UBFC-rPPG, PURE, SCAMPS, BP4D+, and UBFC-PHYS.
+
+"""
+import csv
+import glob
+import os
+import re
+from math import ceil
+from scipy import signal
+from scipy import sparse
+import math
+import multiprocessing as mp
+
+# To be used only for preparing data - for detecting face with YOLO5Face
+# Use 'spawn' on Linux to avoid CUDA reinitialization issues in forked subprocesses when using GPU-based detectors.
+# 'spawn' is slightly slower but safer when CUDA is involved.
+import sys
+try:
+    # Prefer 'spawn' across platforms for robust GPU-compatible multiprocessing
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    # start method already set or not available; continue with the existing method.
+    pass
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
+
+def _preprocess_wrapper_global(loader, data_dirs, config_preprocess, i, file_list_dict):
+    """Module-level wrapper used as multiprocessing target to ensure exceptions
+    inside workers are caught and recorded. This must be module-level so it
+    is picklable when using the 'spawn' start method."""
+    try:
+        loader.preprocess_dataset_subprocess(data_dirs, config_preprocess, i, file_list_dict)
+    except Exception as e:
+        print(f"[ERROR] Preprocess worker failed for index {i}: {e}")
+        try:
+            file_list_dict[i] = []
+        except Exception:
+            pass
+
+class BaseLoader(Dataset):
+    """The base class for data loading based on pytorch Dataset.
+
+    The dataloader supports both providing data for pytorch training and common data-preprocessing methods,
+    including reading files, resizing each frame, chunking, and video-signal synchronization.
+    """
+
+    @staticmethod
+    def add_data_loader_args(parser):
+        """Adds arguments to parser for training process"""
+        parser.add_argument(
+            "--cached_path", default=None, type=str)
+        parser.add_argument(
+            "--preprocess", default=None, action='store_true')
+        return parser
+
+    def __init__(self, dataset_name, raw_data_path, config_data, device=None):
+        """Inits dataloader with lists of files.
+
+        Args:
+            dataset_name(str): name of the dataloader.
+            raw_data_path(string): path to the folder containing all data.
+            config_data(CfgNode): data settings(ref:config.py).
+        """
+        self.inputs = list()
+        self.labels = list()
+        self.dataset_name = dataset_name
+        self.raw_data_path = raw_data_path
+        self.cached_path = config_data.CACHED_PATH
+        self.file_list_path = config_data.FILE_LIST_PATH
+        self.preprocessed_data_len = 0
+        self.data_format = config_data.DATA_FORMAT
+        self.do_preprocess = config_data.DO_PREPROCESS
+        self.preprocess_frames = config_data.PREPROCESS.PREPROCESS_FRAMES
+        self.config_data = config_data
+        # Visualization flag used by some loader crop functions (multiprocessing-safe)
+        # Ensure it's always present to avoid AttributeErrors in worker processes.
+        self._viz_done = False
+
+        if self.do_preprocess and self.preprocess_frames:
+            from dataset.data_loader.face_detector.YOLO5Face import YOLO5Face
+            if 'Y5F' in self.config_data.PREPROCESS.CROP_FACE.BACKEND:
+                self.Y5FObj = YOLO5Face(self.config_data.PREPROCESS.CROP_FACE.BACKEND, device)
+
+        assert (config_data.BEGIN < config_data.END)
+        assert (config_data.BEGIN > 0 or config_data.BEGIN == 0)
+        assert (config_data.END < 1 or config_data.END == 1)
+        if config_data.DO_PREPROCESS:
+            self.raw_data_dirs = self.get_raw_data(self.raw_data_path)
+            self.preprocess_dataset(self.raw_data_dirs, config_data.PREPROCESS, config_data.BEGIN, config_data.END)
+        else:
+            if not os.path.exists(self.cached_path):
+                #print('CACHED_PATH:', self.cached_path)
+                raise ValueError(self.dataset_name,
+                                 'Please set DO_PREPROCESS to True. Preprocessed directory does not exist!')
+            if not os.path.exists(self.file_list_path):
+                #print('File list does not exist... generating now...')
+                self.raw_data_dirs = self.get_raw_data(self.raw_data_path)
+                self.build_file_list_retroactive(self.raw_data_dirs, config_data.BEGIN, config_data.END)
+                #print('File list generated.', end='\n\n')
+
+            self.load_preprocessed_data()
+        #print('Cached Data Path', self.cached_path, end='\n\n')
+        #print('File List Path', self.file_list_path)
+        print(f" {self.dataset_name} Preprocessed Dataset Length: {self.preprocessed_data_len}", end='\n\n')
+
+    def __len__(self):
+        """Returns the length of the dataset."""
+        return len(self.inputs)
+
+    def __getitem__(self, index):
+        """Returns a clip of video(3,T,W,H) and it's corresponding signals(T)."""
+        data = np.load(self.inputs[index])
+        label = np.load(self.labels[index])
+        ##print("data shape before transpose:", data.shape)
+        if self.data_format == 'NDCHW':
+            data = np.transpose(data, (0, 3, 1, 2))
+        elif self.data_format == 'NCDHW':
+            # Original saved clip has shape (T, H, W, C).
+            # For NCDHW we want the sample to be (T, C, H, W) so that
+            # when batched it becomes (B, T, C, H, W) matching trainer expectations
+            # (i.e., data shape: [batch, temporal, channels, H, W]).
+            data = np.transpose(data, (0, 3, 1, 2))
+        elif self.data_format == 'NDHWC':
+            pass
+        else:
+            raise ValueError('Unsupported Data Format!')
+        data = np.float32(data)
+        label = np.float32(label)
+        # item_path is the location of a specific clip in a preprocessing output folder
+        # For example, an item path could be /home/data/PURE_SizeW72_...unsupervised/501_input0.npy
+        item_path = self.inputs[index]
+        ##print("item_path:", item_path)
+        # item_path_filename is simply the filename of the specific clip
+        # For example, the preceding item_path's filename would be 501_input0.npy
+        item_path_filename = item_path.split(os.sep)[-1]
+        # split_idx represents the point in the previous filename where we want to split the string 
+        # in order to retrieve a more precise filename (e.g., 501) preceding the chunk (e.g., input0)
+        split_idx = item_path_filename.rindex('_')
+        # Following the previous comments, the filename for example would be 501
+        filename = item_path_filename[:split_idx]
+        # chunk_id is the extracted, numeric chunk identifier. Following the previous comments, 
+        # the chunk_id for example would be 0
+        chunk_id = item_path_filename[split_idx + 6:].split('.')[0]
+        #print("data shape after transpose:", data.shape, "label shape:", label.shape, "filename:", filename, "chunk_id:", chunk_id)
+        return data, label, filename, chunk_id
+
+    def get_raw_data(self, raw_data_path):
+        """Returns raw data directories under the path.
+
+        Args:
+            raw_data_path(str): a list of video_files.
+        """
+        raise Exception("'get_raw_data' Not Implemented")
+
+    def split_raw_data(self, data_dirs, begin, end):
+        """Returns a subset of data dirs, split with begin and end values, 
+        and ensures no overlapping subjects between splits.
+
+        Args:
+            data_dirs(List[str]): a list of video_files.
+            begin(float): index of begining during train/val split.
+            end(float): index of ending during train/val split.
+        """
+        raise Exception("'split_raw_data' Not Implemented")
+
+    def read_npy_video(self, video_file):
+        """Reads a video file in the numpy format (.npy), returns frames(T,H,W,3)"""
+        frames = np.load(video_file[0])
+        if np.issubdtype(frames.dtype, np.integer) and np.min(frames) >= 0 and np.max(frames) <= 255:
+            processed_frames = [frame.astype(np.uint8)[..., :3] for frame in frames]
+        elif np.issubdtype(frames.dtype, np.floating) and np.min(frames) >= 0.0 and np.max(frames) <= 1.0:
+            processed_frames = [(np.round(frame * 255)).astype(np.uint8)[..., :3] for frame in frames]
+        else:
+            raise Exception(f'Loaded frames are of an incorrect type or range of values! '\
+            + f'Received frames of type {frames.dtype} and range {np.min(frames)} to {np.max(frames)}.')
+        return np.asarray(processed_frames)
+    
+    def preprocess_dataset(self, data_dirs, config_preprocess, begin, end):
+        """Parses and preprocesses all the raw data based on split.
+
+        Args:
+            data_dirs(List[str]): a list of video_files.
+            config_preprocess(CfgNode): preprocessing settings(ref:config.py).
+            begin(float): index of begining during train/val split.
+            end(float): index of ending during train/val split.
+        """
+        data_dirs_split = self.split_raw_data(data_dirs, begin, end)  # partition dataset
+        # send data directories to be processed
+        file_list_dict = self.multi_process_manager(data_dirs_split, config_preprocess)
+
+        # Build a file list by scanning the cache folder (preferred). This ensures any pre-existing
+        # cached clips are included alongside newly generated ones. If scanning fails or yields no
+        # results, fallback to using the per-process outputs stored in file_list_dict.
+        try:
+            # FIXED: Pass original data_dirs (not split) to avoid double-splitting
+            self.build_file_list_retroactive(data_dirs, begin, end)
+            #print("[INFO] File list built by scanning cache (includes pre-existing cached files).")
+        except Exception as e:
+            #print(f"[WARN] build_file_list_retroactive failed ({e}). Falling back to process-produced file list.")
+            self.build_file_list(file_list_dict)
+
+        self.load_preprocessed_data()  # load all data and corresponding labels (sorted for consistency)
+        print("Total Number of raw files preprocessed:", len(data_dirs_split), end='\n\n')
+
+    def preprocess(self, frames, bvps, config_preprocess, phys_axis=[], process_frames=True):
+        """Preprocesses a pair of data.
+
+        Args:
+            frames(np.array): Frames in a video.
+            bvps(np.array): Blood volumne pulse (PPG) signal labels for a video.
+            config_preprocess(CfgNode): preprocessing settings(ref:config.py).
+        Returns:
+            frame_clips(np.array): processed video data by frames
+            bvps_clips(np.array): processed bvp (ppg) labels by frames
+        """
+        if process_frames:
+            # resize frames and crop for face region
+            frames = self.crop_face_resize(
+                frames,
+                config_preprocess.CROP_FACE.DO_CROP_FACE,
+                config_preprocess.CROP_FACE.BACKEND,
+                config_preprocess.CROP_FACE.USE_LARGE_FACE_BOX,
+                config_preprocess.CROP_FACE.LARGE_BOX_COEF,
+                config_preprocess.CROP_FACE.DETECTION.DO_DYNAMIC_DETECTION,
+                config_preprocess.CROP_FACE.DETECTION.DYNAMIC_DETECTION_FREQUENCY,
+                config_preprocess.CROP_FACE.DETECTION.USE_MEDIAN_FACE_BOX,
+                config_preprocess.RESIZE.W,
+                config_preprocess.RESIZE.H)
+            # Check data transformation type
+            data = list()  # Video data
+            for data_type in config_preprocess.DATA_TYPE:
+                f_c = frames.copy()
+                if data_type == "Raw":
+                    data.append(f_c)
+                elif data_type == "DiffNormalized":
+                    data.append(BaseLoader.diff_normalize_data(f_c))
+                elif data_type == "Standardized":
+                    data.append(BaseLoader.standardized_data(f_c))
+                else:
+                    raise ValueError("Unsupported data type!")
+            data = np.concatenate(data, axis=-1)  # concatenate all channels
+        
+        if config_preprocess.LABEL_TYPE == "Raw":
+            pass
+        elif config_preprocess.LABEL_TYPE == "DiffNormalized":
+            bvps = BaseLoader.diff_normalize_label(bvps, axis=phys_axis)
+
+        elif config_preprocess.LABEL_TYPE == "Standardized":
+            bvps = BaseLoader.standardized_label(bvps, axis=phys_axis)
+
+        else:
+            raise ValueError("Unsupported label type!")
+
+        if config_preprocess.DO_CHUNK:  # chunk data into snippets
+            if process_frames:
+                frames_clips, bvps_clips = self.chunk(data, bvps, config_preprocess.CHUNK_LENGTH)
+            else:
+                frames_clips, bvps_clips = self.chunk(np.empty(
+                    0), bvps, config_preprocess.CHUNK_LENGTH, process_frames=process_frames)
+
+        else:
+            if process_frames:
+                frames_clips = np.array([data])
+            else:
+                frames_clips = np.empty(0)
+    
+            bvps_clips = np.array([bvps])
+
+        return frames_clips, bvps_clips
+
+    def face_detection(self, frame, backend, use_larger_box=False, larger_box_coef=1.0):
+        """Face detection on a single frame.
+
+        Args:
+            frame(np.array): a single frame.
+            backend(str): backend to utilize for face detection.
+            use_larger_box(bool): whether to use a larger bounding box on face detection.
+            larger_box_coef(float): Coef. of larger box.
+        Returns:
+            face_box_coor(List[int]): coordinates of face bouding box.
+        """
+        if backend == "HC":
+            # Use OpenCV's Haar Cascade algorithm implementation for face detection
+            # This should only utilize the CPU
+            detector = cv2.CascadeClassifier(
+            './dataset/haarcascade_frontalface_default.xml')
+
+            # Computed face_zone(s) are in the form [x_coord, y_coord, width, height]
+            # (x,y) corresponds to the top-left corner of the zone to define using
+            # the computed width and height.
+            face_zone = detector.detectMultiScale(frame[:, :, :3].astype(np.uint8))
+
+            if len(face_zone) < 1:
+                print("ERROR: No Face Detected")
+                face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
+            elif len(face_zone) >= 2:
+                # Find the index of the largest face zone
+                # The face zones are boxes, so the width and height are the same
+                max_width_index = np.argmax(face_zone[:, 2])  # Index of maximum width
+                face_box_coor = face_zone[max_width_index]
+                print("Warning: More than one faces are detected. Only cropping the biggest one.")
+            else:
+                face_box_coor = face_zone[0]
+        
+        elif "Y5F" in backend:
+            # Use a YOLO5Face trained on WiderFace dataset
+            # This utilizes both the CPU and GPU
+
+            res = self.Y5FObj.detect_face(frame[:, :, :3].astype(np.uint8))
+
+            if res != None:
+                x_min, y_min, x_max, y_max = res
+
+                # Convert to this toolbox's expected format
+                # Expected format: [x_coord, y_coord, width, height]
+                x = x_min
+                y = y_min
+                width = x_max - x_min
+                height = y_max - y_min
+
+                # Find the center of the face zone
+                center_x = x + width // 2
+                center_y = y + height // 2
+
+                # Determine the size of the square (use the maximum of width and height)
+                square_size = max(width, height)
+
+                # Calculate the new coordinates for a square face zone
+                new_x = center_x - (square_size // 2)
+                new_y = center_y - (square_size // 2)
+                face_box_coor = [new_x, new_y, square_size, square_size]
+
+            else:
+                print("ERROR: No Face Detected")
+                face_box_coor = [0, 0, frame.shape[0], frame.shape[1]]
+
+
+
+        elif backend == "THERMAL_OTSU":
+            # Thermal face detection via hotspot percentile thresholding.
+            #
+            # WHY NOT OTSU BINARY: Otsu splits body-vs-background — face+neck+arms
+            # all merge into one large blob because all exposed skin is warm.
+            #
+            # FIX: threshold at the 75th percentile (top 25% hottest pixels).
+            # Forehead/face skin is consistently the hottest region (33-36°C),
+            # distinctly hotter than neck/clothing (28-33°C), so this isolates
+            # the face blob from the rest of the body.
+            gray = frame[:, :, -1].astype(np.float32) if frame.ndim == 3 else frame.astype(np.float32)
+
+            thresh_val = np.percentile(gray, 75)
+            mask = (gray >= thresh_val).astype(np.uint8) * 255
+
+            # Morphological close: fills cold spots within face (eye sockets,
+            # nostrils, mouth) that would otherwise fragment the face blob.
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+            frame_area = frame.shape[0] * frame.shape[1]
+            if num_labels < 2:
+                print(f"[THERMAL_OTSU] ERROR: No face detected (no foreground blobs)")
+                face_box_coor = [0, 0, frame.shape[1], frame.shape[0]]
+            else:
+                # Skip background (label 0); pick largest component
+                component_areas = stats[1:, cv2.CC_STAT_AREA]
+                largest_idx = int(np.argmax(component_areas)) + 1
+                x = int(stats[largest_idx, cv2.CC_STAT_LEFT])
+                y = int(stats[largest_idx, cv2.CC_STAT_TOP])
+                w = int(stats[largest_idx, cv2.CC_STAT_WIDTH])
+                h = int(stats[largest_idx, cv2.CC_STAT_HEIGHT])
+
+                # Reject if blob is still too large (>60% of frame = body not isolated)
+                if stats[largest_idx, cv2.CC_STAT_AREA] > 0.6 * frame_area:
+                    print(f"[THERMAL_OTSU] ERROR: blob covers "
+                          f"{stats[largest_idx, cv2.CC_STAT_AREA]/frame_area:.0%} of frame — face not isolated")
+                    face_box_coor = [0, 0, frame.shape[1], frame.shape[0]]
+                else:
+                    # Square bounding box centered on blob
+                    cx, cy = x + w // 2, y + h // 2
+                    side = max(w, h)
+                    face_box_coor = [cx - side // 2, cy - side // 2, side, side]
+
+        else:
+            raise ValueError("Unsupported face detection backend!")
+
+        if use_larger_box:
+            face_box_coor[0] = max(0, face_box_coor[0] - (larger_box_coef - 1.0) / 2 * face_box_coor[2])
+            face_box_coor[1] = max(0, face_box_coor[1] - (larger_box_coef - 1.0) / 2 * face_box_coor[3])
+            face_box_coor[2] = larger_box_coef * face_box_coor[2]
+            face_box_coor[3] = larger_box_coef * face_box_coor[3]
+        return face_box_coor
+
+    def crop_face_resize(self, frames, use_face_detection, backend, use_larger_box, larger_box_coef, use_dynamic_detection, 
+                         detection_freq, use_median_box, width, height):
+        """Crop face and resize frames.
+
+        Args:
+            frames(np.array): Video frames.
+            use_dynamic_detection(bool): If False, all the frames use the first frame's bouding box to crop the faces
+                                         and resizing.
+                                         If True, it performs face detection every "detection_freq" frames.
+            detection_freq(int): The frequency of dynamic face detection e.g., every detection_freq frames.
+            width(int): Target width for resizing.
+            height(int): Target height for resizing.
+            use_larger_box(bool): Whether enlarge the detected bouding box from face detection.
+            use_face_detection(bool):  Whether crop the face.
+            larger_box_coef(float): the coefficient of the larger region(height and weight),
+                                the middle point of the detected region will stay still during the process of enlarging.
+        Returns:
+            resized_frames(list[np.array(float)]): Resized and cropped frames
+        """
+        # Face Cropping
+        if use_dynamic_detection:
+            num_dynamic_det = ceil(frames.shape[0] / detection_freq)
+        else:
+            num_dynamic_det = 1
+        face_region_all = []
+        det_success = 0
+        det_fallback = 0
+        # Perform face detection by num_dynamic_det" times.
+        for idx in range(num_dynamic_det):
+            if use_face_detection:
+                try:
+                    # Prepare frame for face detection
+                    frame_for_detection = frames[detection_freq * idx]
+                    if backend == "THERMAL_OTSU":
+                        # Pass thermal frame directly; face_detection extracts last channel internally
+                        pass  # frame_for_detection used as-is
+                    elif frame_for_detection.shape[-1] == 1:
+                        # Other backends (HC/Y5F) need 3-ch uint8 fake-RGB
+                        t = frame_for_detection[:, :, 0].astype(np.float32)
+                        t_min, t_max = t.min(), t.max()
+                        t = ((t - t_min) / (t_max - t_min + 1e-7) * 255).astype(np.uint8)
+                        frame_for_detection = np.stack([t, t, t], axis=-1)
+                    elif frame_for_detection.shape[-1] > 3:
+                        frame_for_detection = frame_for_detection[:, :, :3]  # Use only RGB channels
+                    box = self.face_detection(frame_for_detection, backend, use_larger_box, larger_box_coef)
+                    # Check if detection fell back to full-frame (detection failure)
+                    fh, fw = frames.shape[1], frames.shape[2]
+                    is_fullframe = (int(box[0]) == 0 and int(box[1]) == 0 and
+                                    abs(int(box[2]) - fw) <= 2 and abs(int(box[3]) - fh) <= 2)
+                    if is_fullframe:
+                        det_fallback += 1
+                    else:
+                        det_success += 1
+                    face_region_all.append(box)
+                except Exception as e:
+                    # If face detection fails (e.g., YOLO/weights error), fallback to full-frame box
+                    print(f"[WARN] Face detection failed at dynamic idx {idx}: {e}. Falling back to full-frame crop.")
+                    face_region_all.append([0, 0, frames.shape[1], frames.shape[2]])
+                    det_fallback += 1
+            else:
+                face_region_all.append([0, 0, frames.shape[1], frames.shape[2]])
+
+        if use_face_detection and num_dynamic_det > 0:
+            total = det_success + det_fallback
+            print(f"[FaceDetect | {backend}] {det_success}/{total} frames detected  "
+                  f"({100*det_success/max(total,1):.0f}%)  fallback={det_fallback}")
+        face_region_all = np.asarray(face_region_all, dtype='int')
+        if use_median_box:
+            # Generate a median bounding box based on all detected face regions
+            face_region_median = np.median(face_region_all, axis=0).astype('int')
+
+        # Frame Resizing
+        total_frames, wt, ht, channels = frames.shape
+        resized_frames = np.zeros((total_frames, height, width, channels))
+        for i in range(0, total_frames):
+            frame = frames[i]
+            if use_dynamic_detection:  # use the (i // detection_freq)-th facial region.
+                reference_index = i // detection_freq
+            else:  # use the first region obtrained from the first frame.
+                reference_index = 0
+            if use_face_detection:
+                if use_median_box:
+                    face_region = face_region_median
+                else:
+                    face_region = face_region_all[reference_index]
+                frame = frame[max(face_region[1], 0):min(face_region[1] + face_region[3], frame.shape[0]),
+                        max(face_region[0], 0):min(face_region[0] + face_region[2], frame.shape[1])]
+            if (wt != width) or (ht != height):
+                if channels != 3:
+                    # Per-channel resize for non-RGB data (1ch thermal, 4ch RGBT, etc.)
+                    resized_frame = np.zeros((height, width, channels))
+                    for c in range(channels):
+                        resized_frame[:, :, c] = cv2.resize(frame[:, :, c], (width, height), interpolation=cv2.INTER_AREA)
+                    resized_frames[i] = resized_frame
+                else:
+                    resized_frames[i] = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            else:
+                resized_frames[i] = frame
+        return resized_frames
+
+    def chunk(self, frames, bvps, chunk_length, process_frames=True):
+        """Chunk the data into small chunks.
+
+        Args:
+            frames(np.array): video frames.
+            bvps(np.array): blood volumne pulse (PPG) labels.
+            chunk_length(int): the length of each chunk.
+        Returns:
+            frames_clips: all chunks of face cropped frames
+            bvp_clips: all chunks of bvp frames
+        """
+        clip_num = bvps.shape[0] // chunk_length
+        # clip_num = frames.shape[0] // chunk_length
+        if process_frames:
+            frames_clips = [frames[i * chunk_length:(i + 1) * chunk_length] for i in range(clip_num)]
+        else:
+            frames_clips = np.empty(0)
+        
+        bvps_clips = [bvps[i * chunk_length:(i + 1) * chunk_length] for i in range(clip_num)]
+        
+        # print("bvps.shape", bvps.shape)
+        # print("len(bvps_clips)", len(bvps_clips))
+        return np.array(frames_clips), np.array(bvps_clips)
+
+    def save(self, frames_clips, bvps_clips, filename):
+        """Save all the chunked data.
+
+        Args:
+            frames_clips(np.array): blood volumne pulse (PPG) labels.
+            bvps_clips(np.array): the length of each chunk.
+            filename: name the filename
+        Returns:
+            count: count of preprocessed data
+        """
+
+        if not os.path.exists(self.cached_path):
+            os.makedirs(self.cached_path, exist_ok=True)
+        count = 0
+        for i in range(len(bvps_clips)):
+            assert (len(self.inputs) == len(self.labels))
+            input_path_name = self.cached_path + os.sep + "{0}_input{1}.npy".format(filename, str(count))
+            label_path_name = self.cached_path + os.sep + "{0}_label{1}.npy".format(filename, str(count))
+            self.inputs.append(input_path_name)
+            self.labels.append(label_path_name)
+            np.save(input_path_name, frames_clips[i])
+            np.save(label_path_name, bvps_clips[i])
+            count += 1
+        return count
+
+    def save_multi_process(self, frames_clips, bvps_clips, filename, process_frames=True):
+        """Save all the chunked data with multi-thread processing.
+
+        Args:
+            frames_clips(np.array): blood volumne pulse (PPG) labels.
+            bvps_clips(np.array): the length of each chunk.
+            filename: name the filename
+        Returns:
+            input_path_name_list: list of input path names
+            label_path_name_list: list of label path names
+        """
+        
+        if not os.path.exists(self.cached_path):
+            os.makedirs(self.cached_path, exist_ok=True)
+        count = 0
+        input_path_name_list = []
+        label_path_name_list = []
+        for i in range(len(bvps_clips)):
+            assert (len(self.inputs) == len(self.labels))
+            label_path_name = self.cached_path + os.sep + "{0}_label{1}.npy".format(filename, str(count))
+            label_path_name_list.append(label_path_name)
+            np.save(label_path_name, bvps_clips[i])
+
+            if process_frames:
+                input_path_name = self.cached_path + os.sep + "{0}_input{1}.npy".format(filename, str(count))
+                input_path_name_list.append(input_path_name)
+                np.save(input_path_name, frames_clips[i])
+
+            count += 1
+        return input_path_name_list, label_path_name_list
+
+    def multi_process_manager(self, data_dirs, config_preprocess, multi_process_quota=1):
+        """Allocate dataset preprocessing across multiple processes.
+
+        Args:
+            data_dirs(List[str]): a list of video_files.
+            config_preprocess(Dict): a dictionary of preprocessing configurations
+            multi_process_quota(Int): max number of sub-processes to spawn for multiprocessing
+        Returns:
+            file_list_dict(Dict): Dictionary containing information regarding processed data ( path names)
+        """
+        print('Preprocessing dataset...')
+        file_num = len(data_dirs)
+        choose_range = range(0, file_num)
+        pbar = tqdm(list(choose_range))
+
+        # shared data resource
+        manager = mp.Manager()  # multi-process manager
+        file_list_dict = manager.dict()  # dictionary for all processes to store processed files
+        p_list = []  # list of processes
+        running_num = 0  # number of running processes
+
+        # in range of number of files to process
+        for i in choose_range:
+            process_flag = True
+            while process_flag:  # ensure that every i creates a process
+                if running_num < multi_process_quota:  # in case of too many processes
+                    # send data to be preprocessing task
+                    p = mp.Process(target=_preprocess_wrapper_global, 
+                                args=(self, data_dirs,config_preprocess, i, file_list_dict))
+                    p.start()
+                    p_list.append(p)
+                    running_num += 1
+                    process_flag = False
+                for p_ in p_list:
+                    if not p_.is_alive():
+                        p_list.remove(p_)
+                        p_.join()
+                        running_num -= 1
+                        pbar.update(1)
+        # join all processes
+        for p_ in p_list:
+            p_.join()
+            pbar.update(1)
+        pbar.close()
+
+        return file_list_dict
+
+    def build_file_list(self, file_list_dict):
+        """Build a list of files used by the dataloader for the data split. Eg. list of files used for 
+        train / val / test. Also saves the list to a .csv file.
+
+        Args:
+            file_list_dict(Dict): Dictionary containing information regarding processed data ( path names)
+        Returns:
+            None (this function does save a file-list .csv file to self.file_list_path)
+        """
+        file_list = []
+        # iterate through processes and add all processed file paths
+        for process_num, file_paths in file_list_dict.items():
+            file_list = file_list + file_paths
+
+        if not file_list:
+            raise ValueError(self.dataset_name, 'No files in file list')
+
+        file_list_df = pd.DataFrame(file_list, columns=['input_files'])
+        os.makedirs(os.path.dirname(self.file_list_path), exist_ok=True)
+        file_list_df.to_csv(self.file_list_path)  # save file list to .csv
+
+    def build_file_list_retroactive(self, data_dirs, begin, end):
+        """ If a file list has not already been generated for a specific data split build a list of files 
+        used by the dataloader for the data split. Eg. list of files used for 
+        train / val / test. Also saves the list to a .csv file.
+
+        Args:
+            data_dirs(List[str]): a list of video_files.
+            begin(float): index of begining during train/val split.
+            end(float): index of ending during train/val split.
+        Returns:
+            None (this function does save a file-list .csv file to self.file_list_path)
+        """
+
+        # get data split based on begin and end indices.
+        data_dirs_subset = self.split_raw_data(data_dirs, begin, end)
+
+        # generate a list of unique raw-data file names
+        filename_list = []
+        for i in range(len(data_dirs_subset)):
+            filename_list.append(data_dirs_subset[i]['index'])
+        filename_list = list(set(filename_list))  # ensure all indexes are unique
+
+        # generate a list of all preprocessed / chunked data files
+        file_list = []
+        for fname in filename_list:
+            processed_file_data = list(glob.glob(self.cached_path + os.sep + "{0}_input*.npy".format(fname)))
+            file_list += processed_file_data
+
+        if not file_list:
+            raise ValueError(self.dataset_name,
+                             'File list empty. Check preprocessed data folder exists and is not empty.')
+
+        file_list_df = pd.DataFrame(file_list, columns=['input_files'])
+        os.makedirs(os.path.dirname(self.file_list_path), exist_ok=True)
+        file_list_df.to_csv(self.file_list_path)  # save file list to .csv
+
+    def load_preprocessed_data(self):
+        """ Loads the preprocessed data listed in the file list.
+
+        Args:
+            None
+        Returns:
+            None
+        """
+        file_list_path = self.file_list_path  # get list of files in
+        file_list_df = pd.read_csv(file_list_path)
+        inputs = file_list_df['input_files'].tolist()
+        if not inputs:
+            raise ValueError(self.dataset_name + ' dataset loading data error!')
+        inputs = sorted(inputs)  # sort input file name list
+        labels = [input_file.replace("input", "label") for input_file in inputs]
+        self.inputs = inputs
+        self.labels = labels
+        self.preprocessed_data_len = len(inputs)
+
+    @staticmethod
+    def diff_normalize_data(data):
+        """Calculate discrete difference in video data along the time-axis and nornamize by its standard deviation."""
+        n, h, w, c = data.shape
+        diffnormalized_len = n - 1
+        diffnormalized_data = np.zeros((diffnormalized_len, h, w, c), dtype=np.float32)
+        diffnormalized_data_padding = np.zeros((1, h, w, c), dtype=np.float32)
+        for j in range(diffnormalized_len):
+            diffnormalized_data[j, :, :, :] = (data[j + 1, :, :, :] - data[j, :, :, :]) / (
+                    data[j + 1, :, :, :] + data[j, :, :, :] + 1e-7)
+        diffnormalized_data = diffnormalized_data / np.std(diffnormalized_data)
+        diffnormalized_data = np.append(diffnormalized_data, diffnormalized_data_padding, axis=0)
+        diffnormalized_data[np.isnan(diffnormalized_data)] = 0
+        return diffnormalized_data
+
+    @staticmethod
+    def diff_normalize_label(label, axis=[]):
+        """Calculate discrete difference in labels along the time-axis and normalize by its standard deviation."""
+        if len(label.shape) <= 1:
+            diff_label = np.diff(label, axis=0)
+            label = diff_label / np.std(diff_label)
+            label = np.append(label, np.zeros(1), axis=0)
+            label[np.isnan(label)] = 0
+        else:
+            N = label.shape[-1]
+            if axis == []:
+                axis = range(N)
+            for ax in axis:
+                diff_label = np.diff(label[:, ax], axis=0)
+                label[:, ax] = diff_label / np.std(diff_label)
+                label[:, ax] = np.append(label[:, ax], np.zeros(1), axis=0)
+                label[:, ax][np.isnan(label[:, ax])] = 0
+        return label
+
+    @staticmethod
+    def standardized_data(data):
+        """Z-score standardization for video data.
+
+        For multi-channel data (e.g., RGB+Thermal), normalizes each channel
+        independently to preserve the signal characteristics of each modality.
+        """
+        # data shape: (T, H, W, C) where C is number of channels
+        if len(data.shape) == 4 and data.shape[-1] > 1:
+            # Per-channel normalization for multi-channel data
+            num_channels = data.shape[-1]
+            for c in range(num_channels):
+                channel_data = data[..., c]
+                channel_mean = np.mean(channel_data)
+                channel_std = np.std(channel_data)
+                if channel_std > 0:
+                    data[..., c] = (channel_data - channel_mean) / channel_std
+                else:
+                    data[..., c] = channel_data - channel_mean
+            data[np.isnan(data)] = 0
+        else:
+            # Original behavior for single-channel or other shapes
+            data = data - np.mean(data)
+            data = data / np.std(data)
+            data[np.isnan(data)] = 0
+        return data
+
+    @staticmethod
+    def standardized_label(label, axis=[]):
+        """Z-score standardization for label signal."""
+        if len(label.shape) <= 1:
+            label = label - np.mean(label)
+            label = label / np.std(label)
+            label[np.isnan(label)] = 0
+        else:
+            N = label.shape[-1]
+            if axis == []:
+                axis = range(N)
+            for ax in axis:
+                label[:, ax] = label[:, ax] - np.mean(label[:, ax])
+                label[:, ax] = label[:, ax] / np.std(label[:, ax])
+                label[:, ax][np.isnan(label[:, ax])] = 0
+        return label
+
+    @staticmethod
+    def resample_ppg(input_signal, target_length):
+        """Samples a PPG sequence into specific length."""
+        return np.interp(
+            np.linspace(
+                1, input_signal.shape[0], target_length), np.linspace(
+                1, input_signal.shape[0], input_signal.shape[0]), input_signal)

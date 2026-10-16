@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+*.log
+*.pth
+*.ckpt
+runs/
+PreTrainedModels/
+PreprocessedData/
+.DS_Store
+.vscode/
+.idea/
+*.pth
+ckpts/

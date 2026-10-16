@@ -1,0 +1,124 @@
+BASE: ['']
+TOOLBOX_MODE: "train_and_test"
+TRAIN:
+  BATCH_SIZE: 4
+  EPOCHS: 50
+  LR: 9e-3
+  MODEL_FILE_NAME: SIM1_RGBT_RD_ActivityGate_PlacementPostPatch
+  AUG: 0
+  DATA:
+    FS: 27.0
+    DATASET: SIM1RGBT
+    DO_PREPROCESS: True
+    DATA_FORMAT: NDCHW
+    DATA_PATH: "/mnt/nvme/hiqbal/dataset/SIM1"
+    CACHED_PATH: "/mnt/nvme/hiqbal/dataset/SIM1/SIM1_RGBT_RD_cache"
+    EXP_DATA_NAME: ""
+    BEGIN: 0.0
+    END: 0.72
+    PREPROCESS:
+      DATA_TYPE: ['Standardized']
+      LABEL_TYPE: MultiTask
+      DO_CHUNK: True
+      CHUNK_LENGTH: 160
+      CROP_FACE:
+        DO_CROP_FACE: True
+        BACKEND: 'HC'
+        USE_LARGE_FACE_BOX: True
+        LARGE_BOX_COEF: 1.5
+        DETECTION:
+          DO_DYNAMIC_DETECTION: True
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: False
+      SIM1:
+        DATA_MODE: RGBT
+        CONDITIONS: ['RD']
+      RESIZE:
+        H: 128
+        W: 128
+VALID:
+  DATA:
+    FS: 27.0
+    DATASET: SIM1RGBT
+    DO_PREPROCESS: True
+    DATA_FORMAT: NDCHW
+    DATA_PATH: "/mnt/nvme/hiqbal/dataset/SIM1"
+    CACHED_PATH: "/mnt/nvme/hiqbal/dataset/SIM1/SIM1_RGBT_RD_cache"
+    EXP_DATA_NAME: ""
+    BEGIN: 0.72
+    END: 0.86
+    PREPROCESS:
+      DATA_TYPE: ['Standardized']
+      LABEL_TYPE: MultiTask
+      DO_CHUNK: True
+      CHUNK_LENGTH: 160
+      CROP_FACE:
+        DO_CROP_FACE: True
+        BACKEND: 'HC'
+        USE_LARGE_FACE_BOX: True
+        LARGE_BOX_COEF: 1.5
+        DETECTION:
+          DO_DYNAMIC_DETECTION: True
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: False
+      SIM1:
+        DATA_MODE: RGBT
+        CONDITIONS: ['RD']
+      RESIZE:
+        H: 128
+        W: 128
+TEST:
+  METRICS: ['MAE', 'RMSE']
+  USE_LAST_EPOCH: False
+  DATA:
+    FS: 27.0
+    DATASET: SIM1RGBT
+    DO_PREPROCESS: True
+    DATA_FORMAT: NDCHW
+    DATA_PATH: "/mnt/nvme/hiqbal/dataset/SIM1"
+    CACHED_PATH: "/mnt/nvme/hiqbal/dataset/SIM1/SIM1_RGBT_RD_cache"
+    EXP_DATA_NAME: ""
+    BEGIN: 0.86
+    END: 1.0
+    PREPROCESS:
+      DATA_TYPE: ['Standardized']
+      LABEL_TYPE: MultiTask
+      DO_CHUNK: True
+      CHUNK_LENGTH: 160
+      CROP_FACE:
+        DO_CROP_FACE: True
+        BACKEND: 'HC'
+        USE_LARGE_FACE_BOX: True
+        LARGE_BOX_COEF: 1.5
+        DETECTION:
+          DO_DYNAMIC_DETECTION: True
+          DYNAMIC_DETECTION_FREQUENCY: 30
+          USE_MEDIAN_FACE_BOX: False
+      SIM1:
+        DATA_MODE: RGBT
+        CONDITIONS: ['RD']
+      RESIZE:
+        H: 128
+        W: 128
+DEVICE: cuda:0
+NUM_OF_GPU_TRAIN: 1
+LOG:
+  PATH: runs/exp
+MODEL:
+  NAME: RhythmFormerMT
+  RHYTHMFORMERMT:
+    IN_CHANNELS: 4            # R, G, B, T
+    FUSION_TYPE: activity_gate
+    GATE_BLEND_MODE: learned
+    GATE_PLACEMENT: post_patch_embed   # Ablation: gate applied after patch embedding, not at stem
+    TASKS: ['hr', 'br', 'eda']
+    DROP_RATE: 0.2
+    EDA_LOG_MEAN: 5.15
+    EDA_LOG_STD: 1.56
+INFERENCE:
+  BATCH_SIZE: 4
+  EVALUATION_METHOD: "FFT"
+  EVALUATION_WINDOW:
+    USE_SMALLER_WINDOW: False
+    WINDOW_SIZE: 5
+  MODEL_PATH: ""
