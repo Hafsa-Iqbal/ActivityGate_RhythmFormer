@@ -13,3 +13,5 @@ PreprocessedData/
 .idea/
 *.pth
 ckpts/
+!dataset/data_loader/face_detector/ckpts/
+!dataset/data_loader/face_detector/ckpts/Y5sF_WFRGB.pth

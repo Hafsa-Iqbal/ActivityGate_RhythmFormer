@@ -1,3 +1,8 @@
+"""
+Adapted from the yolov5-face project: https://github.com/deepcam-cn/yolov5-face
+(itself based on https://github.com/ultralytics/yolov5), licensed under
+GPL-3.0. See LICENSE in this directory for the full license text.
+"""
 from copy import deepcopy
 import os
 import cv2

@@ -1,3 +1,8 @@
+"""
+Adapted from the yolov5-face project: https://github.com/deepcam-cn/yolov5-face
+(itself based on https://github.com/ultralytics/yolov5), licensed under
+GPL-3.0. See LICENSE in the parent directory for the full license text.
+"""
 import argparse
 import logging
 import math

@@ -28,3 +28,5 @@ Face detection defaults to Haar Cascade (`BACKEND: 'HC'`, bundled with OpenCV an
 ## License
 
 This project builds on [RhythmFormer](https://github.com/zizheng-guo/RhythmFormer) (MIT License; see `LICENSE.txt`), with additional modules and extensions described in the paper.
+
+The optional YOLOv5Face backend (`dataset/data_loader/face_detector/`) is adapted from [yolov5-face](https://github.com/deepcam-cn/yolov5-face) and is licensed separately under GPL-3.0 (see `dataset/data_loader/face_detector/LICENSE`). It is not used by the default configuration or any reported results.
